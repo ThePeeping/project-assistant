@@ -11,7 +11,7 @@ from modules.ui_editor import render_dynamic_editor
 from modules.assistant_tools import AssistantOps
 from modules.logger import EventLogger
 from modules.sync import setup_autorefresh
-from modules.claude_tools import SYSTEM_PROMPT, TOOLS, execute_tool as run_claude_tool
+from modules.claude_tools import TOOLS, build_system_prompt, execute_tool as run_claude_tool
 
 logger = logging.getLogger("project_assistant")
 if not logger.handlers:
@@ -378,10 +378,17 @@ if prompt := st.chat_input("Ask me anything..."):
                     for m in st.session_state.messages[-10:]
                 ]
 
+                try:
+                    task_pages = NOTION_HELPER.list_active_task_pages()
+                except Exception:
+                    logger.exception("Failed to load Notion task context for prompt")
+                    task_pages = []
+                system_prompt = build_system_prompt(task_pages)
+
                 response = ANTHROPIC.messages.create(
                     model=ANTHROPIC_MODEL,
                     max_tokens=2048,
-                    system=SYSTEM_PROMPT,
+                    system=system_prompt,
                     tools=TOOLS,
                     messages=messages,
                 )
@@ -430,7 +437,7 @@ if prompt := st.chat_input("Ask me anything..."):
                     response = ANTHROPIC.messages.create(
                         model=ANTHROPIC_MODEL,
                         max_tokens=2048,
-                        system=SYSTEM_PROMPT,
+                        system=system_prompt,
                         tools=TOOLS,
                         messages=messages,
                     )

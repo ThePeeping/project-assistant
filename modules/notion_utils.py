@@ -104,8 +104,7 @@ class NotionHelper:
         return self.schema()
 
     # ---------- Fetch ----------
-    def list_active_tasks(self) -> List[Dict[str, Any]]:
-        """Return non-completed tasks ordered by due date."""
+    def _active_tasks_query(self) -> tuple[Dict[str, Any], List[str]]:
         active_statuses = self._active_status_names()
         query_kwargs: Dict[str, Any] = {
             "database_id": self.database_id,
@@ -115,6 +114,11 @@ class NotionHelper:
             query_kwargs["filter"] = {
                 "or": [self._status_filter(name) for name in active_statuses]
             }
+        return query_kwargs, active_statuses
+
+    def list_active_tasks(self) -> List[Dict[str, Any]]:
+        """Return non-completed tasks ordered by due date."""
+        query_kwargs, active_statuses = self._active_tasks_query()
 
         resp = self._query_db(**query_kwargs)
         tasks = [self._page_to_task(p) for p in resp.get("results", [])]
@@ -128,6 +132,24 @@ class NotionHelper:
             ]
 
         return tasks
+
+    def list_active_task_pages(self) -> List[Dict[str, Any]]:
+        """Return raw Notion pages for the active-task query."""
+        query_kwargs, active_statuses = self._active_tasks_query()
+        try:
+            resp = self._query_db(**query_kwargs)
+            results = resp.get("results", [])
+            if not active_statuses:
+                filtered = []
+                for page in results:
+                    task_data = self._page_to_task(page) or {}
+                    status = (task_data.get("status") or "").strip().lower()
+                    if status not in COMPLETE_GROUP_NAMES:
+                        filtered.append(page)
+                return filtered
+            return results
+        except Exception:
+            return []
 
     def list_completed_in_range(self, days: int = 7) -> List[Dict[str, Any]]:
         since = (datetime.utcnow() - timedelta(days=days)).isoformat()

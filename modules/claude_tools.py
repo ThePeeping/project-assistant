@@ -1,44 +1,11 @@
 import logging
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import streamlit as st
 from notion_client import Client
 
 logger = logging.getLogger("project_assistant.tools")
-
-SYSTEM_PROMPT = """You are an AI Project Manager helping execute a 52-week plan to build an AI-powered B2B sales training product.
-
-**CRITICAL: You have tools to directly update Notion. Use them proactively!**
-
-When the user says things like:
-- "I finished [task name]" → IMMEDIATELY call update_task_status with new_status="Done"
-- "I completed the outreach setup" → Call update_task_status for that task
-- "Started working on competitor research" → Call update_task_status with new_status="In Progress"
-- "Learned that cold emails work better" → Call add_task_notes to document the learning
-
-DO NOT just acknowledge - TAKE ACTION by calling the appropriate tool.
-
-**Communication Style:**
-- When you update Notion, confirm what you did: "✅ Marked 'Landing Page' as Done in Notion"
-- Be direct and actionable
-- Reference specific task names
-- Celebrate wins briefly, then suggest next steps
-- Challenge scope creep
-- Remind about time constraints (12 hrs/week)
-
-**Context:**
-- User is working 12 hours/week
-- 52-week product launch timeline
-- Currently in Phase 0: Validation and Architecture (Weeks 1-8)
-- Focus: Customer validation and MVP definition
-
-**Your Role:**
-1. Guide daily execution with specific next steps
-2. Update Notion automatically when user reports progress
-3. Keep user focused on current week's critical path
-4. Document learnings and blockers
-"""
 
 TOOLS = [
     {
@@ -79,6 +46,82 @@ TOOLS = [
         },
     },
 ]
+
+
+def _get_title(props: Dict[str, Any]) -> str:
+    title_prop = props.get("Task") or props.get("Title") or {}
+    title_items = title_prop.get("title") or []
+    return title_items[0].get("plain_text", "Untitled") if title_items else "Untitled"
+
+
+def build_system_prompt(current_tasks: List[Dict[str, Any]]) -> str:
+    """Render a dynamic system prompt with current Notion context."""
+    task_lines: List[str] = []
+    for task in current_tasks or []:
+        props = task.get("properties", {})
+        title = _get_title(props)
+        status = (
+            props.get("Status", {})
+            .get("status", {})
+            .get("name", "Unknown")
+        )
+        due_date = (
+            props.get("Due Date", {})
+            .get("date", {})
+            .get("start", "No date")
+        )
+        category = (
+            props.get("Category", {})
+            .get("select", {})
+            .get("name", "Uncategorized")
+        )
+        week = props.get("Week", {}).get("number")
+        week_display = week if week is not None else "?"
+        task_lines.append(
+            f"- **{title}** | Status: {status} | Due: {due_date} | Category: {category} | Week: {week_display}"
+        )
+
+    tasks_text = "\n".join(task_lines) if task_lines else "No active tasks found"
+
+    start_date = datetime(2025, 11, 3)
+    now = datetime.now()
+    current_week = max(1, min(52, ((now - start_date).days // 7) + 1))
+
+    return f"""You are an AI Project Manager helping execute a 52-week plan to build an AI-powered B2B sales training product.
+
+**CURRENT CONTEXT:**
+- **Week {current_week}** of 52-week timeline
+- **Phase:** Phase 0: Validation and Architecture (Weeks 1-8)
+- **Constraint:** 12 hours/week available
+- **Today's Date:** {now.strftime("%Y-%m-%d")}
+
+**ACTIVE TASKS IN NOTION:**
+{tasks_text}
+
+**CRITICAL: You have tools to directly update Notion. Use them proactively!**
+
+When the user says things like:
+- "I finished [task name]" → IMMEDIATELY call update_task_status with new_status="Done"
+- "What should I work on today?" → Analyze the tasks above and recommend the highest-priority item based on due dates and critical path
+- "Started working on [task]" → Call update_task_status with new_status="In Progress"
+- "Learned that X" → Call add_task_notes to document the learning
+
+**Communication Style:**
+- When you update Notion, confirm what you did: "✅ Marked 'Landing Page' as Done in Notion"
+- Be direct and actionable - use the task names from the list above
+- When asked "What should I work on?", immediately analyze the tasks above and give specific recommendations
+- Reference specific task names, due dates, and dependencies from the context
+- Celebrate wins briefly, then suggest next steps
+- Challenge scope creep (tasks not in the current week)
+- Remind about time constraints (12 hrs/week)
+
+**Your Role:**
+1. Guide daily execution with specific next steps based on the task list above
+2. Update Notion automatically when user reports progress
+3. Keep user focused on Week {current_week}'s critical path
+4. Document learnings and blockers
+5. When asked for priorities, look at what's due soonest and what's blocking other work
+"""
 
 
 def find_task_by_title(notion: Client, database_id: str, task_title: str) -> str | None:
