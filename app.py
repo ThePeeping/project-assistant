@@ -21,7 +21,6 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
-MAX_TOOL_ITERATIONS = 3
 
 
 def _get_block_attr(block, attr, default=None):
@@ -30,19 +29,6 @@ def _get_block_attr(block, attr, default=None):
     if isinstance(block, dict):
         return block.get(attr, default)
     return default
-
-
-def _format_messages_for_llm(messages):
-    formatted = []
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            formatted.append({"role": msg["role"], "content": content})
-        else:
-            formatted.append(
-                {"role": msg["role"], "content": [{"type": "text", "text": content or ""}]}
-            )
-    return formatted
 
 
 def _should_skip_render(message):
@@ -65,6 +51,16 @@ def _render_message_content(content):
                 parts.append(f"[Tool result: {block.get('content')}]")
         return "\n\n".join([p for p in parts if p]).strip()
     return content
+
+
+def _serialize_block(block):
+    if hasattr(block, "model_dump"):
+        return block.model_dump()
+    if isinstance(block, dict):
+        return block
+    if hasattr(block, "__dict__"):
+        return block.__dict__
+    return {"type": str(block)}
 
 
 # ---------- Page config ----------
@@ -154,75 +150,20 @@ def execute_tool(tool_name: str, tool_input: dict) -> dict:
     return run_claude_tool(tool_name, tool_input, NOTION, NOTION_DB_ID)
 
 
-def run_llm_turn():
-    """Run an Anthropic turn, handling any tool calls automatically."""
-    formatted_messages = _format_messages_for_llm(st.session_state.messages)
-    for iteration in range(MAX_TOOL_ITERATIONS):
-        logger.info("Requesting Anthropic response (iteration %d)", iteration + 1)
-        response = ANTHROPIC.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=formatted_messages,
-        )
-        text_parts = []
-        tool_calls = []
-        for block in response.content:
-            block_type = _get_block_attr(block, "type")
-            if block_type == "text":
-                text_parts.append(_get_block_attr(block, "text", ""))
-            elif block_type == "tool_use":
-                tool_calls.append(block)
-
-        if not tool_calls:
-            assistant_reply = "\n\n".join(part for part in text_parts if part).strip()
-            if assistant_reply:
-                st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
-            return assistant_reply
-
-        for call in tool_calls:
-            tool_name = _get_block_attr(call, "name")
-            tool_input = _get_block_attr(call, "input", {}) or {}
-            tool_id = _get_block_attr(call, "id")
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": tool_id,
-                            "name": tool_name,
-                            "input": tool_input,
-                        }
-                    ],
-                }
-            )
-            result = execute_tool(tool_name, tool_input)
-            logger.info("Tool %s executed with result %s", tool_name, result)
-            if result.get("success"):
-                st.session_state.tasks = fetch_active_tasks()
-            st.session_state.messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_id,
-                            "content": json.dumps(result),
-                        }
-                    ],
-                }
-            )
-        formatted_messages = _format_messages_for_llm(st.session_state.messages)
-
-    raise RuntimeError("Exceeded maximum tool iterations without final response")
-
 # ---------- App services ----------
 # Your NotionHelper requires a notion_token, pass it explicitly
 NOTION_HELPER = NotionHelper(NOTION, NOTION_DB_ID, st.secrets["NOTION_TOKEN"])
 ASSIST_OPS = AssistantOps(ANTHROPIC)
 LOGGER = EventLogger(SUPABASE)
+
+
+def save_message(role: str, content: str) -> None:
+    """Persist chat messages via the EventLogger."""
+    try:
+        LOGGER.log("chat_message", USER_ID, {"role": role, "content": content})
+    except Exception:
+        logger.exception("Failed to save %s message", role)
+
 
 AUTH_USERNAME = "assiomar"
 AUTH_PASSWORD = "wBmTt$Wcf3poo@ZEX$"
@@ -419,19 +360,98 @@ for m in st.session_state.messages:
     with st.chat_message(role):
         st.write(rendered)
 
-prompt = st.chat_input("Type an instruction or question...")
-if prompt:
-    logger.info("Chat prompt from %s: %s", USER_ID, prompt)
-    st.chat_message("user").write(prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt})
+if prompt := st.chat_input("Ask me anything..."):
+    with st.chat_message("user"):
+        st.write(prompt)
 
-    try:
-        reply = run_llm_turn()
-        if reply:
-            st.chat_message("assistant").write(reply)
-    except Exception as e:
-        logger.exception("Chat handler failed for prompt '%s'", prompt)
-        st.chat_message("assistant").write(f"Could not process: {e}")
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    save_message("user", prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            try:
+                messages = [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state.messages[-10:]
+                ]
+
+                response = ANTHROPIC.messages.create(
+                    model=ANTHROPIC_MODEL,
+                    max_tokens=2048,
+                    system=SYSTEM_PROMPT,
+                    tools=TOOLS,
+                    messages=messages,
+                )
+
+                while getattr(response, "stop_reason", None) == "tool_use":
+                    serialized_content = [_serialize_block(block) for block in response.content]
+                    messages.append({"role": "assistant", "content": serialized_content})
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": serialized_content}
+                    )
+
+                    tool_use = next(
+                        (block for block in serialized_content if block.get("type") == "tool_use"),
+                        None,
+                    )
+
+                    if not tool_use:
+                        break
+
+                    tool_name = tool_use.get("name", "unknown_tool")
+                    tool_input = tool_use.get("input", {}) or {}
+                    st.info(f"🔧 Using tool: {tool_name}")
+
+                    tool_result = execute_tool(tool_name, tool_input)
+
+                    if tool_result.get("success"):
+                        st.success(tool_result["message"])
+                        st.session_state.tasks = fetch_active_tasks()
+                    else:
+                        st.warning(tool_result.get("message", "Tool did not return a message"))
+
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use.get("id"),
+                                    "content": str(tool_result),
+                                }
+                            ],
+                        }
+                    )
+                    st.session_state.messages.append(messages[-1])
+
+                    response = ANTHROPIC.messages.create(
+                        model=ANTHROPIC_MODEL,
+                        max_tokens=2048,
+                        system=SYSTEM_PROMPT,
+                        tools=TOOLS,
+                        messages=messages,
+                    )
+
+                assistant_message = next(
+                    (
+                        block.get("text")
+                        for block in [_serialize_block(b) for b in response.content]
+                        if block.get("type") == "text"
+                    ),
+                    "I encountered an issue. Please try again.",
+                )
+
+                st.write(assistant_message)
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": assistant_message}
+                )
+                save_message("assistant", assistant_message)
+            except Exception as e:
+                logger.exception("Anthropic call failed")
+                st.error(f"Error: {e}")
 
 # ---------- Weekly report ----------
 st.divider()
