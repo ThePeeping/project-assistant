@@ -11,7 +11,7 @@ from modules.ui_editor import render_dynamic_editor
 from modules.assistant_tools import AssistantOps
 from modules.logger import EventLogger
 from modules.sync import setup_autorefresh
-
+from modules.claude_tools import SYSTEM_PROMPT, TOOLS, execute_tool as run_claude_tool
 
 logger = logging.getLogger("project_assistant")
 if not logger.handlers:
@@ -19,6 +19,52 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+MAX_TOOL_ITERATIONS = 3
+
+
+def _get_block_attr(block, attr, default=None):
+    if hasattr(block, attr):
+        return getattr(block, attr)
+    if isinstance(block, dict):
+        return block.get(attr, default)
+    return default
+
+
+def _format_messages_for_llm(messages):
+    formatted = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            formatted.append({"role": msg["role"], "content": content})
+        else:
+            formatted.append(
+                {"role": msg["role"], "content": [{"type": "text", "text": content or ""}]}
+            )
+    return formatted
+
+
+def _should_skip_render(message):
+    content = message.get("content")
+    if isinstance(content, list):
+        return all(block.get("type") == "tool_result" for block in content)
+    return False
+
+
+def _render_message_content(content):
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            block_type = block.get("type")
+            if block_type == "text":
+                parts.append(block.get("text", ""))
+            elif block_type == "tool_use":
+                parts.append(f"[Tool call: {block.get('name')}]")
+            elif block_type == "tool_result":
+                parts.append(f"[Tool result: {block.get('content')}]")
+        return "\n\n".join([p for p in parts if p]).strip()
+    return content
 
 
 # ---------- Page config ----------
@@ -101,6 +147,76 @@ def init_clients():
 
 ANTHROPIC, NOTION, SUPABASE = init_clients()
 NOTION_DB_ID = st.secrets["NOTION_DATABASE_ID"]
+
+
+def execute_tool(tool_name: str, tool_input: dict) -> dict:
+    """Proxy tool execution through the shared Notion client."""
+    return run_claude_tool(tool_name, tool_input, NOTION, NOTION_DB_ID)
+
+
+def run_llm_turn():
+    """Run an Anthropic turn, handling any tool calls automatically."""
+    formatted_messages = _format_messages_for_llm(st.session_state.messages)
+    for iteration in range(MAX_TOOL_ITERATIONS):
+        logger.info("Requesting Anthropic response (iteration %d)", iteration + 1)
+        response = ANTHROPIC.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=2000,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=formatted_messages,
+        )
+        text_parts = []
+        tool_calls = []
+        for block in response.content:
+            block_type = _get_block_attr(block, "type")
+            if block_type == "text":
+                text_parts.append(_get_block_attr(block, "text", ""))
+            elif block_type == "tool_use":
+                tool_calls.append(block)
+
+        if not tool_calls:
+            assistant_reply = "\n\n".join(part for part in text_parts if part).strip()
+            if assistant_reply:
+                st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
+            return assistant_reply
+
+        for call in tool_calls:
+            tool_name = _get_block_attr(call, "name")
+            tool_input = _get_block_attr(call, "input", {}) or {}
+            tool_id = _get_block_attr(call, "id")
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": tool_name,
+                            "input": tool_input,
+                        }
+                    ],
+                }
+            )
+            result = execute_tool(tool_name, tool_input)
+            logger.info("Tool %s executed with result %s", tool_name, result)
+            if result.get("success"):
+                st.session_state.tasks = fetch_active_tasks()
+            st.session_state.messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": json.dumps(result),
+                        }
+                    ],
+                }
+            )
+        formatted_messages = _format_messages_for_llm(st.session_state.messages)
+
+    raise RuntimeError("Exceeded maximum tool iterations without final response")
 
 # ---------- App services ----------
 # Your NotionHelper requires a notion_token, pass it explicitly
@@ -284,11 +400,24 @@ st.divider()
 st.subheader("Chat Assistant")
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Hi, I can update Notion for you. Try: Mark 'Landing page' as Done."}]
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": "Hi, I can update Notion for you. Try: Mark 'Landing page' as Done.",
+        }
+    ]
 
 for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.write(m["content"])
+    if _should_skip_render(m):
+        continue
+    role = m.get("role", "assistant")
+    if role not in {"user", "assistant"}:
+        role = "assistant"
+    rendered = _render_message_content(m.get("content"))
+    if not rendered:
+        continue
+    with st.chat_message(role):
+        st.write(rendered)
 
 prompt = st.chat_input("Type an instruction or question...")
 if prompt:
@@ -296,31 +425,10 @@ if prompt:
     st.chat_message("user").write(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    lower = prompt.lower()
-    logger.debug("Normalized chat prompt: %s", lower)  # DEV-LOG
-    responded = False
     try:
-        if lower.startswith("mark ") and " as done" in lower:
-            title = prompt.split("Mark ")[-1].split(" as done")[0].strip("'\" ")
-            logger.debug("Parsed chat title candidate: %s", title)  # DEV-LOG
-            task = next((t for t in st.session_state.tasks if title.lower() in t["title"].lower()), None)
-            if task:
-                logger.info("Chat mark-as-done matched task '%s'", task["title"])
-                NOTION_HELPER.update_property(task["id"], "Status", "Done")
-                summary = ASSIST_OPS.summarize_completion(task["title"], task.get("notes") or "")
-                NOTION_HELPER.append_notes(task["id"], summary)
-                LOGGER.log("status_done", USER_ID, {"task": task["title"]})
-                st.chat_message("assistant").write(f"Marked '{task['title']}' as Done and added a summary.")
-                st.session_state.tasks = fetch_active_tasks()
-                responded = True
-            else:
-                logger.warning(
-                    "Chat mark-as-done request did not match any task for fragment '%s'",
-                    title,
-                )
-        if not responded:
-            st.chat_message("assistant").write("Got it. Use the editor on the right or say things like, Set due date of X to 2025-11-12.")
-            logger.info("Chat prompt from %s routed to generic helper response", USER_ID)
+        reply = run_llm_turn()
+        if reply:
+            st.chat_message("assistant").write(reply)
     except Exception as e:
         logger.exception("Chat handler failed for prompt '%s'", prompt)
         st.chat_message("assistant").write(f"Could not process: {e}")
