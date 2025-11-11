@@ -1,11 +1,22 @@
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List
 
 import streamlit as st
 from notion_client import Client
 
 logger = logging.getLogger("project_assistant.tools")
+
+PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system.md"
+try:
+    BASE_INSTRUCTIONS = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").strip()
+except FileNotFoundError:
+    BASE_INSTRUCTIONS = (
+        "You are an AI Project Manager helping execute a 52-week plan to build an "
+        "AI-powered B2B sales training product."
+    )
 
 TOOLS = [
     {
@@ -49,12 +60,22 @@ TOOLS = [
 
 
 def _get_title(props: Dict[str, Any]) -> str:
-    title_prop = props.get("Task") or props.get("Title") or {}
-    title_items = title_prop.get("title") or []
-    return title_items[0].get("plain_text", "Untitled") if title_items else "Untitled"
+    candidates = ["Task", "Title", "Name"]
+    for key in candidates:
+        title_prop = props.get(key) or {}
+        title_items = title_prop.get("title") or []
+        if title_items:
+            return title_items[0].get("plain_text") or "Untitled"
+
+    for prop in props.values():
+        if prop.get("type") == "title":
+            items = prop.get("title") or []
+            if items:
+                return items[0].get("plain_text") or "Untitled"
+    return "Untitled"
 
 
-def build_system_prompt(current_tasks: List[Dict[str, Any]]) -> str:
+def build_system_prompt(current_tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Render a dynamic system prompt with current Notion context."""
     task_lines: List[str] = []
     for task in current_tasks or []:
@@ -87,9 +108,7 @@ def build_system_prompt(current_tasks: List[Dict[str, Any]]) -> str:
     now = datetime.now()
     current_week = max(1, min(52, ((now - start_date).days // 7) + 1))
 
-    return f"""You are an AI Project Manager helping execute a 52-week plan to build an AI-powered B2B sales training product.
-
-**CURRENT CONTEXT:**
+    dynamic_context = f"""**CURRENT CONTEXT:**
 - **Week {current_week}** of 52-week timeline
 - **Phase:** Phase 0: Validation and Architecture (Weeks 1-8)
 - **Constraint:** 12 hours/week available
@@ -97,31 +116,19 @@ def build_system_prompt(current_tasks: List[Dict[str, Any]]) -> str:
 
 **ACTIVE TASKS IN NOTION:**
 {tasks_text}
-
-**CRITICAL: You have tools to directly update Notion. Use them proactively!**
-
-When the user says things like:
-- "I finished [task name]" → IMMEDIATELY call update_task_status with new_status="Done"
-- "What should I work on today?" → Analyze the tasks above and recommend the highest-priority item based on due dates and critical path
-- "Started working on [task]" → Call update_task_status with new_status="In Progress"
-- "Learned that X" → Call add_task_notes to document the learning
-
-**Communication Style:**
-- When you update Notion, confirm what you did: "✅ Marked 'Landing Page' as Done in Notion"
-- Be direct and actionable - use the task names from the list above
-- When asked "What should I work on?", immediately analyze the tasks above and give specific recommendations
-- Reference specific task names, due dates, and dependencies from the context
-- Celebrate wins briefly, then suggest next steps
-- Challenge scope creep (tasks not in the current week)
-- Remind about time constraints (12 hrs/week)
-
-**Your Role:**
-1. Guide daily execution with specific next steps based on the task list above
-2. Update Notion automatically when user reports progress
-3. Keep user focused on Week {current_week}'s critical path
-4. Document learnings and blockers
-5. When asked for priorities, look at what's due soonest and what's blocking other work
 """
+
+    return [
+        {
+            "type": "text",
+            "text": BASE_INSTRUCTIONS,
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": dynamic_context,
+        },
+    ]
 
 
 def find_task_by_title(notion: Client, database_id: str, task_title: str) -> str | None:

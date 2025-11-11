@@ -20,6 +20,10 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
+if "last_task_fetch" not in st.session_state:
+    st.session_state.last_task_fetch = None
+    st.session_state.cached_tasks = []
+
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 
 
@@ -157,6 +161,30 @@ ASSIST_OPS = AssistantOps(ANTHROPIC)
 LOGGER = EventLogger(SUPABASE)
 
 
+def invalidate_task_cache() -> None:
+    st.session_state.last_task_fetch = None
+    st.session_state.cached_tasks = []
+
+
+def get_current_tasks() -> list[dict]:
+    return NOTION_HELPER.list_active_task_pages()
+
+
+def get_current_tasks_cached() -> list[dict]:
+    should_refresh = (
+        st.session_state.last_task_fetch is None
+        or datetime.now() - st.session_state.last_task_fetch > timedelta(seconds=60)
+    )
+    if should_refresh:
+        try:
+            st.session_state.cached_tasks = get_current_tasks()
+        except Exception:
+            logger.exception("Failed to refresh cached Notion tasks")
+            st.session_state.cached_tasks = []
+        st.session_state.last_task_fetch = datetime.now()
+    return st.session_state.cached_tasks
+
+
 def save_message(role: str, content: str) -> None:
     """Persist chat messages via the EventLogger."""
     try:
@@ -198,6 +226,7 @@ with st.sidebar:
         logger.info("Manual task refresh triggered by %s", USER_ID)
         logger.debug("Clearing cached tasks before schema refresh")  # DEV-LOG
         st.session_state.pop("tasks", None)
+        invalidate_task_cache()
         NOTION_HELPER.refresh_schema()
         st.rerun()
 
@@ -248,6 +277,7 @@ with st.sidebar.expander("➕ Create Task", expanded=False):
             logger.info("Task '%s' created with page_id=%s", new_title, page_id)
             st.success("Created")
             st.session_state.tasks = fetch_active_tasks()
+            invalidate_task_cache()
             st.rerun()
         except Exception as e:
             logger.exception(
@@ -273,6 +303,7 @@ with st.sidebar.expander("🗑️ Delete Task", expanded=False):
                 logger.info("Task '%s' archived", del_sel)
                 st.success("Archived in Notion")
                 st.session_state.tasks = fetch_active_tasks()
+                invalidate_task_cache()
                 st.rerun()
         except Exception as e:
             logger.exception(
@@ -332,6 +363,7 @@ with col_right:
             logger.info("Bulk update saved for task '%s'", selected_task["title"])
             LOGGER.log("bulk_update", USER_ID, {"task": selected_task["title"]})
             st.session_state.tasks = fetch_active_tasks()
+            invalidate_task_cache()
             st.success("Saved changes")
     else:
         st.caption("Nothing to edit")
@@ -378,11 +410,7 @@ if prompt := st.chat_input("Ask me anything..."):
                     for m in st.session_state.messages[-10:]
                 ]
 
-                try:
-                    task_pages = NOTION_HELPER.list_active_task_pages()
-                except Exception:
-                    logger.exception("Failed to load Notion task context for prompt")
-                    task_pages = []
+                task_pages = get_current_tasks_cached()
                 system_prompt = build_system_prompt(task_pages)
 
                 response = ANTHROPIC.messages.create(
@@ -417,6 +445,7 @@ if prompt := st.chat_input("Ask me anything..."):
                     if tool_result.get("success"):
                         st.success(tool_result["message"])
                         st.session_state.tasks = fetch_active_tasks()
+                        invalidate_task_cache()
                     else:
                         st.warning(tool_result.get("message", "Tool did not return a message"))
 
@@ -479,6 +508,7 @@ if st.button("Generate report"):
         logger.info(
             "Weekly report '%s' created with %d completed items", title, len(completed)
         )
+        invalidate_task_cache()
         st.success("Report created in Notion under your database as a new page")
     except Exception as e:
         logger.exception("Failed to generate weekly report for user %s", USER_ID)
